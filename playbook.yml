@@ -1,0 +1,315 @@
+---
+- name: Setup Debian Server
+  hosts: all
+  become: yes
+  vars:
+    root_password: "Alma1234"
+    ssh_port: 2222
+  tasks:
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Set root password
+      user:
+        name: root
+        password: "{{ root_password | password_hash('sha512') }}"
+
+    - name: Create a new user
+      user:
+        name: your_username
+        password: "{{ 'your_password' | password_hash('sha512') }}"
+        groups: sudo
+        shell: /bin/bash
+
+    - name: Create separate partitions for /opt and /tmp
+      filesystem:
+        fstype: ext4
+        dev: "/dev/sdb1"
+        opts: "-F"
+      mount:
+        path: /opt
+        src: /dev/sdb1
+        fstype: ext4
+
+    - name: Create /tmp partition
+      filesystem:
+        fstype: ext4
+        dev: "/dev/sdb2"
+        opts: "-F"
+      mount:
+        path: /tmp
+        src: /dev/sdb2
+        fstype: ext4
+
+    - name: Install sudo
+      apt:
+        name: sudo
+        state: present
+
+    - name: Install Midnight Commander
+      apt:
+        name: mc
+        state: present
+
+    - name: Install htop
+      apt:
+        name: htop
+        state: present
+
+    - name: Install OpenJDK 8
+      apt:
+        name: openjdk-8-jdk
+        state: present
+
+    - name: Install OpenJDK 11
+      apt:
+        name: openjdk-11-jdk
+        state: present
+
+    - name: Set default Java version to OpenJDK 8
+      alternatives:
+        name: java
+        link: /usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java
+        path: /usr/lib/jvm/java-8-openjdk-amd64/jre/bin/java
+        priority: 1080
+
+    - name: Create udemx user
+      user:
+        name: udemx
+        home: /opt/udemx
+        createhome: yes
+        password: "{{ 'udemx_password' | password_hash('sha512') }}"
+
+    - name: Install OpenSSH server
+      apt:
+        name: openssh-server
+        state: present
+
+    - name: Change SSH port
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#Port 22'
+        line: "Port {{ ssh_port }}"
+
+    - name: Disable password authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#PasswordAuthentication yes'
+        line: "PasswordAuthentication no"
+
+    - name: Allow PEM-based login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#PubkeyAuthentication yes'
+        line: "PubkeyAuthentication yes"
+
+    - name: Install fail2ban
+      apt:
+        name: fail2ban
+        state: present
+
+    - name: Configure fail2ban for SSH
+      copy:
+        content: |
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          logpath = %(sshd_log)s
+          maxretry = 3
+        dest: /etc/fail2ban/jail.local
+
+    - name: Restart SSH and Fail2ban
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - ssh
+        - fail2ban
+
+    - name: Install NGINX
+      apt:
+        name: nginx
+        state: present
+
+    - name: Install MariaDB
+      apt:
+        name: mariadb-server
+        state: present
+
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+
+    - name: Install Git
+      apt:
+        name: git
+        state: present
+
+    - name: Configure Git user
+      git_config:
+        name: user.name
+        scope: global
+        value: "udemx"
+    - git_config:
+        name: user.email
+        scope: global
+        value: "udemx@udemx.eu"
+
+    - name: Install self-signed SSL certificate for NGINX
+      shell: |
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/nginx-selfsigned.key -out /etc/ssl/certs/nginx-selfsigned.crt -subj "/CN=localhost"
+
+    - name: Configure NGINX for HTTPS
+      copy:
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              listen 443 ssl default_server;
+              listen [::]:443 ssl default_server;
+              ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+              ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+
+              root /var/www/html;
+              index index.html index.htm index.nginx-debian.html;
+
+              server_name _;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+          }
+        dest: /etc/nginx/sites-available/default
+
+    - name: Reload NGINX
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Create Hello UDEMX page
+      copy:
+        content: "Hello UDEMX!"
+        dest: /var/www/html/index.html
+
+    - name: Create udemx-db user in MariaDB
+      mysql_user:
+        name: udemx
+        password: udemx_password
+        priv: "*.*:ALL"
+        state: present
+
+    - name: Run hello-world Docker container
+      command: docker run hello-world
+
+    - name: Ensure NGINX and MariaDB containers run on startup
+      copy:
+        content: |
+          version: '3'
+          services:
+            nginx:
+              image: nginx:latest
+              ports:
+                - "80:80"
+                - "443:443"
+            mariadb:
+              image: mariadb:latest
+              environment:
+                MYSQL_ROOT_PASSWORD: root_password
+                MYSQL_DATABASE: udemx
+                MYSQL_USER: udemx
+                MYSQL_PASSWORD: udemx_password
+              ports:
+                - "3306:3306"
+        dest: /opt/docker-compose.yml
+
+    - name: Start Docker containers on boot
+      systemd:
+        name: docker-compose
+        enabled: yes
+        state: started
+        service_manager: auto
+        daemon_reload: yes
+        masked: no
+        generated_from_template: |
+          [Unit]
+          Description=Docker Compose Application Service
+          Requires=docker.service
+          After=docker.service
+
+          [Service]
+          WorkingDirectory=/opt
+          ExecStart=/usr/local/bin/docker-compose up
+          ExecStop=/usr/local/bin/docker-compose down
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Setup iptables
+      iptables:
+        rules:
+          - rule: "ACCEPT"
+            chain: "INPUT"
+            state: "RELATED,ESTABLISHED"
+          - rule: "ACCEPT"
+            chain: "INPUT"
+            protocol: "tcp"
+            dport: [22, 80, 443, 3306]
+          - rule: "DROP"
+            chain: "INPUT"
+
+    - name: Create MySQL dump script
+      copy:
+        content: |
+          #!/bin/bash
+          mysqldump -u root -p'root_password' udemx > /opt/scripts/mysql-dump-$(date +\%F).sql
+        dest: /opt/scripts/mysql-dump.sh
+        mode: '0755'
+
+    - name: Schedule MySQL dump script in cron
+      cron:
+        name: "Daily MySQL dump"
+        minute: 0
+        hour: 2
+        job: "/opt/scripts/mysql-dump.sh"
+
+    - name: Create log analysis scripts
+      copy:
+        content: |
+          #!/bin/bash
+          ls -lt /var/log | head -n 3 > /opt/scripts/mod-$(date +\%F).out
+          find /var/log -mtime -5 > /opt/scripts/last_five-$(date +\%F).out
+          awk '{print $3}' /proc/loadavg > /opt/scripts/loadavg-$(date +\%F).out
+        dest: /opt/scripts/log-analysis.sh
+        mode: '0755'
+
+    - name: Modify NGINX default configuration
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^<title>Welcome to nginx!</title>'
+        line: "<title>Welcome to nginx!</title>"
+
+    - name: Install Jenkins in Docker
+      command: docker run -d -v /var/jenkins_home:/var/jenkins_home -p 8080:8080 -p 50000:50000 jenkins/jenkins:lts
+
+    - name: Install private Docker registry
+      command: docker run -d -p 5000:5000 --name registry registry:2
+
+    - name: Install Docker registry UI
+      command: docker run -d -p 8081:80 --name registry-ui joxit/docker-registry-ui:static --env REGISTRY_TITLE=PrivateRegistry --env REGISTRY_URL=http://localhost:5000 --env DELETE_IMAGES=true
+
+    - name: Create Jenkins job script
+      copy:
+        content: |
+        dest: /opt/scripts/Jenkinsfile
+
+    - name: Upload Jenkinsfile to GitHub
+      git:
+        repo: 'git@github.com:your-ballaizsolt/udemx_tasks.git'
+        dest: /opt/udemx_tasks
+        key_file: /path/to/your/private/key
+        accept_hostkey: yes
+        force: yes
